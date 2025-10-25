@@ -144,6 +144,8 @@ type Server struct {
 	Log          *slog.Logger         // minimal no-alloc logger
 	hooks        *Hooks               // hooks contains hooks for extra functionality such as auth and persistent storage
 	inlineClient *Client              // inlineClient is a special client used for inline subscriptions and inline Publish
+
+	OnInflightDrop func(cl *Client, pk packets.Packet, sub packets.Subscription, from *Client)
 }
 
 // loop contains interval tickers for the system events loop.
@@ -933,7 +935,7 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 	// When it publishes a package with a qos > 0, the server treats
 	// the package as qos=0, and the client receives it as qos=1 or 2.
 	if pk.FixedHeader.Qos == 0 || cl.Net.Inline {
-		s.publishToSubscribers(pk)
+		s.publishToSubscribers(pk, cl)
 		s.hooks.OnPublished(cl, pk)
 		return nil
 	}
@@ -962,7 +964,7 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 		s.hooks.OnQosComplete(cl, ack)
 	}
 
-	s.publishToSubscribers(pk)
+	s.publishToSubscribers(pk, cl)
 	s.hooks.OnPublished(cl, pk)
 
 	return nil
@@ -982,7 +984,7 @@ func (s *Server) retainMessage(cl *Client, pk packets.Packet) {
 }
 
 // publishToSubscribers publishes a publish packet to all subscribers with matching topic filters.
-func (s *Server) publishToSubscribers(pk packets.Packet) {
+func (s *Server) publishToSubscribers(pk packets.Packet, from *Client) {
 	if pk.Ignore {
 		return
 	}
@@ -1013,7 +1015,7 @@ func (s *Server) publishToSubscribers(pk packets.Packet) {
 
 	for id, subs := range subscribers.Subscriptions {
 		if cl, ok := s.Clients.Get(id); ok {
-			_, err := s.publishToClient(cl, subs, pk)
+			_, err := s.publishToClient(cl, subs, pk, from)
 			if err != nil {
 				s.Log.Debug("failed publishing packet", "error", err, "client", cl.ID, "packet", pk)
 			}
@@ -1021,7 +1023,82 @@ func (s *Server) publishToSubscribers(pk packets.Packet) {
 	}
 }
 
-func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packets.Packet) (packets.Packet, error) {
+func (s *Server) PublishToClient(cl *Client, pk packets.Packet) (packets.Packet, error) {
+	out := pk.Copy(false)
+	if !s.hooks.OnACLCheck(cl, pk.TopicName, false) {
+		return out, packets.ErrNotAuthorized
+	}
+
+	if out.FixedHeader.Qos > s.Options.Capabilities.MaximumQos {
+		out.FixedHeader.Qos = s.Options.Capabilities.MaximumQos // [MQTT-3.2.2-9]
+	}
+
+	if cl.Properties.Props.TopicAliasMaximum > 0 {
+		var aliasExists bool
+		out.Properties.TopicAlias, aliasExists = cl.State.TopicAliases.Outbound.Set(pk.TopicName)
+		if out.Properties.TopicAlias > 0 {
+			out.Properties.TopicAliasFlag = true
+			if aliasExists {
+				out.TopicName = ""
+			}
+		}
+	}
+
+	if out.FixedHeader.Qos > 0 {
+		if cl.State.Inflight.Len() >= int(s.Options.Capabilities.MaximumInflight) {
+			// add hook?
+			atomic.AddInt64(&s.Info.InflightDropped, 1)
+			if s.Options.Capabilities.MaximumInflight > 0 {
+				s.Log.Warn("client store quota reached", "client", cl.ID, "listener", cl.Net.Listener, "Max:", s.Options.Capabilities.MaximumInflight)
+			}
+			return out, packets.ErrQuotaExceeded
+		}
+
+		i, err := cl.NextPacketID() // [MQTT-4.3.2-1] [MQTT-4.3.3-1]
+		if err != nil {
+			s.hooks.OnPacketIDExhausted(cl, pk)
+			atomic.AddInt64(&s.Info.InflightDropped, 1)
+			s.Log.Warn("packet ids exhausted", "error", err, "client", cl.ID, "listener", cl.Net.Listener)
+			return out, packets.ErrQuotaExceeded
+		}
+
+		out.PacketID = uint16(i) // [MQTT-2.2.1-4]
+		sentQuota := atomic.LoadInt32(&cl.State.Inflight.sendQuota)
+
+		if ok := cl.State.Inflight.Set(out); ok { // [MQTT-4.3.2-3] [MQTT-4.3.3-3]
+			atomic.AddInt64(&s.Info.Inflight, 1)
+			s.hooks.OnQosPublish(cl, out, out.Created, 0)
+			cl.State.Inflight.DecreaseSendQuota()
+		}
+
+		if sentQuota == 0 && atomic.LoadInt32(&cl.State.Inflight.maximumSendQuota) > 0 {
+			out.Expiry = -1
+			cl.State.Inflight.Set(out)
+			return out, nil
+		}
+	}
+
+	if cl.Net.Conn == nil || cl.Closed() {
+		return out, packets.CodeDisconnect
+	}
+
+	select {
+	case cl.State.outbound <- &out:
+		atomic.AddInt32(&cl.State.outboundQty, 1)
+	default:
+		atomic.AddInt64(&s.Info.MessagesDropped, 1)
+		cl.ops.hooks.OnPublishDropped(cl, pk)
+		if out.FixedHeader.Qos > 0 {
+			cl.State.Inflight.Delete(out.PacketID) // packet was dropped due to irregular circumstances, so rollback inflight.
+			cl.State.Inflight.IncreaseSendQuota()
+		}
+		return out, packets.ErrPendingClientWritesExceeded
+	}
+
+	return out, nil
+}
+
+func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packets.Packet, from *Client) (packets.Packet, error) {
 	if sub.NoLocal && pk.Origin == cl.ID {
 		return pk, nil // [MQTT-3.8.3-3]
 	}
@@ -1065,7 +1142,12 @@ func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packet
 		if cl.State.Inflight.Len() >= int(s.Options.Capabilities.MaximumInflight) {
 			// add hook?
 			atomic.AddInt64(&s.Info.InflightDropped, 1)
-			s.Log.Warn("client store quota reached", "client", cl.ID, "listener", cl.Net.Listener)
+			if s.Options.Capabilities.MaximumInflight > 0 {
+				s.Log.Warn("client store quota reached", "client", cl.ID, "listener", cl.Net.Listener, "Max:", s.Options.Capabilities.MaximumInflight)
+			}
+			if s.OnInflightDrop != nil {
+				s.OnInflightDrop(cl, out, sub, from)
+			}
 			return out, packets.ErrQuotaExceeded
 		}
 
@@ -1124,7 +1206,7 @@ func (s *Server) publishRetainedToClient(cl *Client, sub packets.Subscription, e
 
 	sub.FwdRetainedFlag = true
 	for _, pkv := range s.Topics.Messages(sub.Filter) { // [MQTT-3.8.4-4]
-		_, err := s.publishToClient(cl, sub, pkv)
+		_, err := s.publishToClient(cl, sub, pkv, nil)
 		if err != nil {
 			s.Log.Debug("failed to publish retained message", "error", err, "client", cl.ID, "listener", cl.Net.Listener, "packet", pkv)
 			continue
@@ -1486,7 +1568,7 @@ func (s *Server) publishSysTopics() {
 		pk.TopicName = topic
 		pk.Payload = []byte(payload)
 		s.Topics.RetainMessage(pk.Copy(false))
-		s.publishToSubscribers(pk)
+		s.publishToSubscribers(pk, nil)
 	}
 
 	s.hooks.OnSysInfoTick(info)
@@ -1546,7 +1628,7 @@ func (s *Server) sendLWT(cl *Client) {
 		s.retainMessage(cl, pk)
 	}
 
-	s.publishToSubscribers(pk)                      // [MQTT-3.1.2-8]
+	s.publishToSubscribers(pk, nil)                 // [MQTT-3.1.2-8]
 	atomic.StoreUint32(&cl.Properties.Will.Flag, 0) // [MQTT-3.1.2-10]
 	s.hooks.OnWillSent(cl, pk)
 }
@@ -1745,7 +1827,7 @@ func (s *Server) clearExpiredInflights(now int64) {
 func (s *Server) sendDelayedLWT(dt int64) {
 	for id, pk := range s.loop.willDelayed.GetAll() {
 		if dt > pk.Expiry {
-			s.publishToSubscribers(pk) // [MQTT-3.1.2-8]
+			s.publishToSubscribers(pk, nil) // [MQTT-3.1.2-8]
 			if cl, ok := s.Clients.Get(id); ok {
 				if pk.FixedHeader.Retain {
 					s.retainMessage(cl, pk)
