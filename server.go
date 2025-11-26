@@ -182,9 +182,9 @@ func New(opts *Options) *Server {
 		Listeners: listeners.New(),
 		loop: &loop{
 			sysTopics:      time.NewTicker(time.Second * time.Duration(opts.SysTopicResendInterval)),
-			clientExpiry:   time.NewTicker(time.Second),
-			inflightExpiry: time.NewTicker(time.Second),
-			retainedExpiry: time.NewTicker(time.Second),
+			clientExpiry:   time.NewTicker(time.Second * 30),
+			inflightExpiry: time.NewTicker(time.Second * 15),
+			retainedExpiry: time.NewTicker(time.Second * 30),
 			willDelaySend:  time.NewTicker(time.Second),
 			willDelayed:    packets.NewPackets(),
 		},
